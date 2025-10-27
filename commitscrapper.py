@@ -76,7 +76,7 @@ EMOJI_SHORTCODES = {
 }
 
 # File paths
-INPUT_CSV = "github_affiliation_combined.csv"
+INPUT_CSV = "github_affiliation_combined_cleaned.csv"
 OUTPUT_CSV = "results/political_emoji_commits.csv"
 LOG_DIR = "logs"
 LOG_FILE = f"{LOG_DIR}/scraper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -85,6 +85,11 @@ LOG_FILE = f"{LOG_DIR}/scraper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 REQUEST_DELAY = 0.05  # 50ms delay between requests
 RATE_LIMIT_SLEEP = 3600  # 1 hour sleep when all tokens exhausted
 MAX_WORKERS = 20  # Maximum concurrent workers
+
+# Filter Configuration
+# Set to True to check only repos with affiliation (deepseek or chatgpt)
+# Set to False to check ALL repos regardless of affiliation
+FILTER_BY_AFFILIATION = False  # Default: only check repos with affiliation
 
 # README file patterns to check
 README_PATTERNS = [
@@ -625,7 +630,7 @@ def process_repository(
 # ============================================================================
 
 def load_repositories() -> List[Dict]:
-    """Load repositories from CSV where affiliation is not 'none'"""
+    """Load repositories from CSV (filtered by affiliation or all repos based on config)"""
     logger.info(f"📖 Loading repositories from {INPUT_CSV}...")
     
     repos = []
@@ -637,8 +642,19 @@ def load_repositories() -> List[Dict]:
                 deepseek_aff = row.get('affiliation_deepseek', 'none').strip().lower()
                 chatgpt_aff = row.get('affiliation_openai', 'none').strip().lower()
                 
-                # Filter: either deepseek or chatgpt affiliation is NOT "none"
-                if deepseek_aff != 'none' or chatgpt_aff != 'none':
+                # Filter based on configuration
+                if FILTER_BY_AFFILIATION:
+                    # Only process repos where either affiliation is NOT "none"
+                    if deepseek_aff != 'none' or chatgpt_aff != 'none':
+                        repos.append({
+                            'repo_owner': row['repo_owner'],
+                            'repo_name': row['repo_name'],
+                            'repo_url': row['repo_url'],
+                            'affiliation_deepseek': row.get('affiliation_deepseek', 'none'),
+                            'affiliation_openai': row.get('affiliation_openai', 'none')
+                        })
+                else:
+                    # Process ALL repos regardless of affiliation
                     repos.append({
                         'repo_owner': row['repo_owner'],
                         'repo_name': row['repo_name'],
@@ -647,7 +663,11 @@ def load_repositories() -> List[Dict]:
                         'affiliation_openai': row.get('affiliation_openai', 'none')
                     })
         
-        logger.info(f"✓ Loaded {len(repos)} repositories with affiliation")
+        if FILTER_BY_AFFILIATION:
+            logger.info(f"✓ Loaded {len(repos)} repositories with affiliation (filtered mode)")
+        else:
+            logger.info(f"✓ Loaded {len(repos)} repositories (all repos mode)")
+        
         return repos
         
     except Exception as e:
@@ -696,11 +716,13 @@ def main():
     notifier = DiscordNotifier()
     
     # Send start notification
+    filter_mode = "Affiliation filter enabled" if FILTER_BY_AFFILIATION else "All repos mode"
     notifier.send(
         f"🚀 Scraping started\n"
         f"📊 Tokens: {len(token_manager.tokens)}\n"
         f"⚙️ Max workers: {MAX_WORKERS}\n"
-        f"🕒 Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"� Filter: {filter_mode}\n"
+        f"�🕒 Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}",
         "Scraper Started"
     )
     
@@ -711,7 +733,9 @@ def main():
         logger.error("❌ No repositories to process!")
         return
     
-    logger.info(f"🎯 Processing {len(repositories)} repositories with {MAX_WORKERS} workers")
+    # Log configuration
+    filter_status = "with affiliation only" if FILTER_BY_AFFILIATION else "all repos (no filter)"
+    logger.info(f"🎯 Processing {len(repositories)} repositories ({filter_status}) with {MAX_WORKERS} workers")
     
     # Process repositories with threading
     all_results = []

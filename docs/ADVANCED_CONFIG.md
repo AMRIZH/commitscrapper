@@ -44,15 +44,43 @@ RATE_LIMIT_SLEEP = 3600
 
 ## Filtering Repositories
 
-### Current Logic
+### Affiliation Filter Toggle
+
+**Configuration Variable** (line ~95 in `commitscrapper.py`):
 
 ```python
-# Processes repos where EITHER affiliation is not "none"
-if deepseek_aff != 'none' or chatgpt_aff != 'none':
-    repos.append(row)
+# Set to True to check only repos with affiliation (deepseek or chatgpt)
+# Set to False to check ALL repos regardless of affiliation
+FILTER_BY_AFFILIATION = True  # Default: only check repos with affiliation
 ```
 
-### Alternative Filters
+**Behavior**:
+- `True` (Default): Processes only repositories where **either** DeepSeek or ChatGPT affiliation is not "none" (~118 repos)
+- `False`: Processes **all** repositories in the CSV file (~150+ repos)
+
+**When to use each setting**:
+- **FILTER_BY_AFFILIATION = True**: 
+  - Focus on repos with known AI tool affiliations
+  - Faster execution (fewer repos)
+  - Original project scope
+  
+- **FILTER_BY_AFFILIATION = False**: 
+  - Comprehensive analysis across all repos
+  - Discover emoji usage in non-affiliated projects
+  - Broader dataset for research
+
+**Discord notification** will show current filter mode:
+```
+🔍 Filter: Affiliation filter enabled
+```
+or
+```
+🔍 Filter: All repos mode
+```
+
+### Custom Filtering Logic
+
+If you need more specific filtering beyond the toggle, modify the `load_repositories()` function:
 
 **Both affiliations required**:
 ```python

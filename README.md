@@ -93,13 +93,38 @@ Results are saved in `results/political_emoji_commits.csv` with columns:
 
 ## Configuration
 
+### Basic Settings
+
 Edit `commitscrapper.py` to adjust:
 
 ```python
 REQUEST_DELAY = 0.05          # Delay between requests (50ms)
 RATE_LIMIT_SLEEP = 3600       # Sleep time when all tokens exhausted (1 hour)
 MAX_WORKERS = 20              # Maximum concurrent workers
+
+# Filter Configuration
+FILTER_BY_AFFILIATION = True  # True: only repos with affiliation, False: all repos
 ```
+
+### Filter Configuration
+
+**FILTER_BY_AFFILIATION** - Controls which repositories to process:
+
+- **`True` (Default)**: Processes only repositories where either DeepSeek or ChatGPT affiliation is NOT "none" (~118 repos)
+- **`False`**: Processes ALL repositories in the CSV file regardless of affiliation (~150+ repos)
+
+**Usage**:
+```python
+# Option 1: Only affiliated repos (faster, focused dataset)
+FILTER_BY_AFFILIATION = True
+
+# Option 2: All repos (comprehensive analysis)
+FILTER_BY_AFFILIATION = False
+```
+
+The current filter mode will be shown in Discord notifications and console logs when scraping starts.
+
+See [Advanced Configuration](docs/ADVANCED_CONFIG.md) for more tuning options.
 
 ## How It Works
 
