@@ -3,3 +3,4 @@ results/
 .env
 venv/
 github_affiliation_combined.csv
+__pycache__
