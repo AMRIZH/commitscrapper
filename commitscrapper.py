@@ -265,11 +265,10 @@ class TokenManager:
     def all_tokens_exhausted(self) -> bool:
         """Check if all tokens are exhausted"""
         with self.lock:
-            for stats in self.token_stats.values():
-                if stats["remaining"] > 10:
-                    if stats["reset_time"] is None or datetime.now() >= stats["reset_time"]:
-                        return False
-            return True
+            for token in self.tokens:
+                if self._is_token_available(token):
+                    return False  # At least one token is available
+            return True  # All tokens are exhausted
 
 # ============================================================================
 # DISCORD NOTIFICATIONS
