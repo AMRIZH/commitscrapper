@@ -851,6 +851,97 @@ def save_results(results: List[CommitResult]):
         logger.error(f"❌ Failed to save results: {e}")
         raise
 
+def generate_final_report(
+    start_time: datetime,
+    end_time: datetime,
+    total_repos: int,
+    processed_count: int,
+    results: List[CommitResult],
+    error_count: int,
+    stats: Dict
+) -> str:
+    """Generate comprehensive final report"""
+    duration = end_time - start_time
+    
+    # Calculate emoji statistics
+    emoji_counts = {}
+    for result in results:
+        for emoji in result.emojis_detected.split('|'):
+            if emoji:
+                emoji_counts[emoji] = emoji_counts.get(emoji, 0) + 1
+    
+    # Sort emojis by frequency
+    top_emojis = sorted(emoji_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    
+    # Calculate affiliation statistics
+    deepseek_count = sum(1 for r in results if r.deepseek_affiliation.lower() != 'none')
+    chatgpt_count = sum(1 for r in results if r.chatgpt_affiliation.lower() != 'none')
+    
+    # Build report
+    report = f"""
+{'='*80}
+GitHub Political Emoji Commit Scraper - Final Report
+{'='*80}
+
+EXECUTION SUMMARY
+-----------------
+Start Time:        {start_time.strftime('%Y-%m-%d %H:%M:%S')}
+End Time:          {end_time.strftime('%Y-%m-%d %H:%M:%S')}
+Duration:          {duration}
+Status:            {'✅ Completed Successfully' if processed_count == total_repos else '⚠️ Partial Completion'}
+
+REPOSITORY STATISTICS
+----------------------
+Total Repositories: {total_repos:,}
+Processed:          {processed_count:,} ({processed_count/total_repos*100:.1f}%)
+Errors:             {error_count:,}
+Success Rate:       {(processed_count - error_count)/processed_count*100:.1f}%
+
+EMOJI COMMIT FINDINGS
+---------------------
+Total Emoji Commits: {len(results):,}
+Unique Repositories: {len(set(f"{r.repo_owner}/{r.repo_name}" for r in results)):,}
+From Pull Requests:  {sum(1 for r in results if r.is_pull_request):,} ({sum(1 for r in results if r.is_pull_request)/len(results)*100:.1f}% if results else 0)
+
+Top 10 Most Used Emojis:
+"""
+    
+    for idx, (emoji, count) in enumerate(top_emojis, 1):
+        report += f"  {idx:2}. {emoji}  →  {count:,} commits\n"
+    
+    report += f"""
+AFFILIATION ANALYSIS
+--------------------
+DeepSeek Affiliated:  {deepseek_count:,} commits ({deepseek_count/len(results)*100:.1f}% of emoji commits)
+ChatGPT Affiliated:   {chatgpt_count:,} commits ({chatgpt_count/len(results)*100:.1f}% of emoji commits)
+
+API USAGE STATISTICS
+--------------------
+Total API Requests:   {stats['total_requests']:,}
+Tokens Used:          {stats['total_tokens']}
+Available Tokens:     {stats['available_tokens']}/{stats['total_tokens']}
+Exhausted Tokens:     {stats['exhausted_tokens']}/{stats['total_tokens']}
+
+CONFIGURATION
+-------------
+Filter Mode:          {'Affiliation filter' if FILTER_BY_AFFILIATION else 'All repos mode'}
+Max Workers:          {MAX_WORKERS}
+Request Delay:        {REQUEST_DELAY}s
+Rate Limit Sleep:     {RATE_LIMIT_SLEEP}s ({RATE_LIMIT_SLEEP/3600:.1f} hour)
+
+OUTPUT FILES
+------------
+Results CSV:          {OUTPUT_CSV}
+Log File:             {LOG_FILE}
+Report File:          results/report.txt
+
+{'='*80}
+Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+{'='*80}
+"""
+    
+    return report
+
 def watchdog_thread(processed_count_ref: Dict, total_repos: int, notifier: DiscordNotifier, stop_event: threading.Event):
     """Watchdog thread to detect if scraping has hung"""
     last_count = 0
@@ -875,14 +966,13 @@ def watchdog_thread(processed_count_ref: Dict, total_repos: int, notifier: Disco
             hang_checks += 1
             logger.warning(f"⚠️ Watchdog: No progress for {hang_checks * 2} minutes ({current_count}/{total_repos})")
             
-            # If no progress for 10 minutes (5 checks), send alert
-            if hang_checks >= 5:
+            # If no progress for 20 minutes (10 checks), send alert
+            if hang_checks >= 10:
                 notifier.send(
-                    f"🚨 Possible Hang Detected!\n"
+                    f"🚨 Possible Hang!\n"
                     f"No progress for {hang_checks * 2} minutes\n"
-                    f"Stuck at: {current_count}/{total_repos}\n"
-                    f"Check logs for details",
-                    "Hang Alert"
+                    f"Stuck at: {current_count}/{total_repos}",
+                    "🚨 Hang Alert"
                 )
                 hang_checks = 0  # Reset to avoid spam
 
@@ -898,15 +988,18 @@ def main():
     github_client = GitHubClient(token_manager)
     notifier = DiscordNotifier()
     
-    # Send start notification
+    # Send start notification with configuration
     filter_mode = "Affiliation filter enabled" if FILTER_BY_AFFILIATION else "All repos mode"
     notifier.send(
-        f"🚀 Scraping started\n"
-        f"📊 Tokens: {len(token_manager.tokens)}\n"
-        f"⚙️ Max workers: {MAX_WORKERS}\n"
-        f"� Filter: {filter_mode}\n"
-        f"�🕒 Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}",
-        "Scraper Started"
+        f"🚀 Scraper Started\n"
+        f"⚙️ Configuration:\n"
+        f"  • Tokens: {len(token_manager.tokens)}\n"
+        f"  • Workers: {MAX_WORKERS}\n"
+        f"  • Filter: {filter_mode}\n"
+        f"  • Request delay: {REQUEST_DELAY}s\n"
+        f"  • Rate limit sleep: {RATE_LIMIT_SLEEP}s\n"
+        f"🕒 {start_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "🚀 Started"
     )
     
     # Load repositories
@@ -980,16 +1073,22 @@ def main():
                     
                     last_progress_log = current_time
                     
-                    # Send progress update to Discord
-                    if processed_count % 50 == 0:
+                    # Send progress update to Discord only at 25%, 50%, 75%, 100%
+                    # Calculate percentage milestones
+                    milestone_25 = int(len(repositories) * 0.25)
+                    milestone_50 = int(len(repositories) * 0.50)
+                    milestone_75 = int(len(repositories) * 0.75)
+                    milestone_100 = len(repositories)
+                    
+                    if processed_count in [milestone_25, milestone_50, milestone_75, milestone_100]:
                         notifier.send(
-                            f"📊 Progress Update\n"
-                            f"Processed: {processed_count}/{len(repositories)} ({progress:.1f}%)\n"
+                            f"📊 Progress Milestone: {progress:.0f}%\n"
+                            f"Processed: {processed_count}/{len(repositories)}\n"
                             f"Emoji commits found: {len(all_results)}\n"
                             f"Errors: {error_count}\n"
-                            f"Tokens: {stats['available_tokens']} available, {stats['exhausted_tokens']} exhausted\n"
+                            f"Tokens: {stats['available_tokens']}/{stats['total_tokens']} available\n"
                             f"Total API requests: {stats['total_requests']}",
-                            "Progress Update"
+                            f"Milestone: {progress:.0f}% Complete"
                         )
                 
                 # Check if global sleep mode is active (one thread will handle the sleep)
@@ -1007,15 +1106,14 @@ def main():
                 # Send notification if too many consecutive errors
                 if consecutive_errors >= 10:
                     current_time = datetime.now()
-                    # Only send error notification every 5 minutes
-                    if (current_time - last_error_notification).total_seconds() >= 300:
+                    # Only send error notification every 10 minutes (reduced spam)
+                    if (current_time - last_error_notification).total_seconds() >= 600:
                         notifier.send(
-                            f"⚠️ High Error Rate Detected\n"
+                            f"⚠️ High Error Rate\n"
                             f"Consecutive errors: {consecutive_errors}\n"
                             f"Total errors: {error_count}\n"
-                            f"Progress: {processed_count}/{len(repositories)}\n"
-                            f"Last error: {error_msg}",
-                            "Error Alert"
+                            f"Progress: {processed_count}/{len(repositories)} ({(processed_count/len(repositories)*100):.0f}%)",
+                            "⚠️ Error Alert"
                         )
                         last_error_notification = current_time
                         consecutive_errors = 0  # Reset after notification
@@ -1047,18 +1145,48 @@ def main():
     logger.info(f"📝 Log file: {LOG_FILE}")
     logger.info("="*80)
     
+    # Generate comprehensive report
+    final_report = generate_final_report(
+        start_time, end_time, len(repositories), processed_count,
+        all_results, error_count, stats
+    )
+    
+    # Print report to console
+    logger.info("\n" + final_report)
+    
+    # Save report to file
+    report_file = "results/report.txt"
+    try:
+        with open(report_file, 'w', encoding='utf-8') as f:
+            f.write(final_report)
+        logger.info(f"📄 Report saved to: {report_file}")
+    except Exception as e:
+        logger.error(f"❌ Failed to save report: {e}")
+    
+    # Send completion notification to Discord (concise version with stats)
+    emoji_commits = len(all_results)
+    unique_repos = len(set(f"{r.repo_owner}/{r.repo_name}" for r in all_results)) if all_results else 0
+    
+    # Calculate top 3 emojis
+    emoji_counts = {}
+    for result in all_results:
+        for emoji in result.emojis_detected.split('|'):
+            if emoji:
+                emoji_counts[emoji] = emoji_counts.get(emoji, 0) + 1
+    top_3_emojis = sorted(emoji_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+    top_emojis_str = ", ".join([f"{emoji} ({count})" for emoji, count in top_3_emojis]) if top_3_emojis else "None"
+    
     # Send completion notification
     notifier.send(
-        f"✅ Scraping completed!\n\n"
+        f"✅ Scraping Completed!\n\n"
         f"⏱️ Duration: {duration}\n"
-        f"📊 Repositories: {processed_count}\n"
-        f"🎯 Emoji commits found: {len(all_results)}\n"
-        f"❌ Errors: {error_count}\n"
-        f"🔑 API requests: {stats['total_requests']}\n"
-        f"💾 Output: {OUTPUT_CSV}",
-        "Scraper Completed"
+        f"📊 Repos: {processed_count:,}/{len(repositories):,}\n"
+        f"🎯 Emoji Commits: {emoji_commits:,} (from {unique_repos:,} repos)\n"
+        f"❌ Errors: {error_count:,}\n"
+        f"🔥 Top Emojis: {top_emojis_str}\n"
+        f"📄 Full report: results/report.txt",
+        "✅ Completed"
     )
-
 if __name__ == "__main__":
     try:
         main()
