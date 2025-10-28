@@ -360,10 +360,19 @@ class GitHubClient:
         self.graphql_url = "https://api.github.com/graphql"
         self.rest_base = "https://api.github.com"
         self.session = requests.Session()
+        # Configure connection pool to handle concurrent requests
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=MAX_WORKERS,
+            pool_maxsize=MAX_WORKERS * 2,
+            max_retries=0  # We handle retries manually
+        )
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
     
     def _make_request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
         """Make HTTP request with token rotation and rate limit handling"""
-        max_retries = 3
+        max_retries = 5  # Increased from 3 to 5
+        retry_delays = [2, 5, 10, 20, 30]  # Progressive backoff delays in seconds
         
         for attempt in range(max_retries):
             # Check if we're in global sleep mode
@@ -390,34 +399,80 @@ class GitHubClient:
                     remaining = int(response.headers['X-RateLimit-Remaining'])
                     reset = int(response.headers['X-RateLimit-Reset'])
                     self.token_manager.update_rate_limit(token, remaining, reset)
+                    
+                    # Log warning if token is running low
+                    if remaining < 100:
+                        logger.warning(f"⚠️ Token running low: {remaining} requests remaining")
                 
-                # Handle rate limiting
-                if response.status_code == 403 and 'rate limit' in response.text.lower():
-                    logger.warning(f"Rate limit hit for current token (remaining: {remaining if 'remaining' in locals() else 'unknown'})")
-                    
-                    # Check if all tokens are exhausted (avoid retry spam)
-                    if self.token_manager.all_tokens_exhausted():
-                        logger.warning("All tokens exhausted, stopping retries")
+                # Handle different error codes
+                if response.status_code == 403:
+                    if 'rate limit' in response.text.lower():
+                        logger.warning(f"Rate limit hit for current token (remaining: {remaining if 'remaining' in locals() else 'unknown'})")
+                        
+                        # Check if all tokens are exhausted (avoid retry spam)
+                        if self.token_manager.all_tokens_exhausted():
+                            logger.warning("All tokens exhausted, stopping retries")
+                            return None
+                        
+                        # Try next token
+                        logger.debug(f"Retrying with next token (attempt {attempt + 1}/{max_retries})...")
+                        continue
+                    else:
+                        logger.warning(f"403 Forbidden (not rate limit): {response.text[:200]}")
                         return None
-                    
-                    # Try next token
-                    logger.debug(f"Retrying with next token (attempt {attempt + 1}/{max_retries})...")
+                
+                # Handle server errors (502, 503, 504) with retry
+                elif response.status_code in [502, 503, 504]:
+                    error_name = {502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout"}
+                    logger.warning(
+                        f"🔄 {response.status_code} {error_name.get(response.status_code)} - "
+                        f"Retrying in {retry_delays[attempt]}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(retry_delays[attempt])
                     continue
                 
-                # Handle other errors
-                if response.status_code == 404:
+                # Handle not found
+                elif response.status_code == 404:
                     logger.debug(f"Resource not found: {url}")
                     return None
                 
+                # Handle other client errors (400, 401, etc.) - don't retry
+                elif 400 <= response.status_code < 500:
+                    logger.warning(f"Client error {response.status_code}: {response.text[:200]}")
+                    return None
+                
+                # Raise for any other error status
                 response.raise_for_status()
                 return response
                 
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {e}")
-                if attempt == max_retries - 1:
+            except requests.exceptions.Timeout as e:
+                logger.warning(f"⏱️ Request timeout (attempt {attempt + 1}/{max_retries}): {url}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delays[attempt])
+                    continue
+                else:
+                    logger.error(f"❌ Request timed out after {max_retries} attempts")
                     return None
-                time.sleep(1 * (attempt + 1))  # Exponential backoff
+                    
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"🔌 Connection error (attempt {attempt + 1}/{max_retries}): {str(e)[:100]}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delays[attempt])
+                    continue
+                else:
+                    logger.error(f"❌ Connection failed after {max_retries} attempts")
+                    return None
+                    
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {str(e)[:100]}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delays[attempt])
+                    continue
+                else:
+                    logger.error(f"❌ Request failed after {max_retries} attempts: {e}")
+                    return None
         
+        logger.error(f"❌ All {max_retries} retry attempts exhausted for {url}")
         return None
     
     def graphql_query(self, query: str, variables: Dict = None) -> Optional[Dict]:
@@ -559,122 +614,145 @@ def process_repository(
     logger.info(f"📂 Processing: {owner}/{name}")
     
     results = []
+    max_retries = 3  # Retry failed repos
     
-    try:
-        # Try different README file variations
-        readme_found = False
-        for readme_path in README_PATTERNS:
-            logger.debug(f"  Checking for {readme_path}...")
-            
-            # Get commit history for this README file
-            commits_data = github_client.search_commits(owner, name, readme_path)
-            
-            if not commits_data:
-                continue
-            
-            repo_data_gql = commits_data.get('repository')
-            if not repo_data_gql:
-                continue
-            
-            default_branch = repo_data_gql.get('defaultBranchRef')
-            if not default_branch:
-                continue
-            
-            target = default_branch.get('target')
-            if not target:
-                continue
-            
-            history = target.get('history')
-            if not history:
-                continue
-            
-            edges = history.get('edges', [])
-            if not edges:
-                continue
-            
-            readme_found = True
-            logger.info(f"  ✓ Found {len(edges)} commits for {readme_path}")
-            
-            # Process each commit
-            for edge in edges:
-                node = edge['node']
-                commit_sha = node['oid']
+    for repo_attempt in range(max_retries):
+        try:
+            # Try different README file variations
+            readme_found = False
+            for readme_path in README_PATTERNS:
+                logger.debug(f"  Checking for {readme_path}...")
                 
-                # Get detailed commit info with diff
-                commit_details = github_client.get_commit_details(owner, name, commit_sha)
+                # Get commit history for this README file
+                commits_data = github_client.search_commits(owner, name, readme_path)
                 
-                if not commit_details:
+                if not commits_data:
+                    logger.debug(f"  No data returned for {readme_path}")
                     continue
                 
-                # Find README file in commit
-                readme_file = None
-                for file in commit_details.get('files', []):
-                    if file['filename'].upper() == readme_path.upper():
-                        readme_file = file
-                        break
-                
-                if not readme_file:
+                repo_data_gql = commits_data.get('repository')
+                if not repo_data_gql:
+                    logger.debug(f"  No repository data for {readme_path}")
                     continue
                 
-                # Get the patch (diff)
-                patch = readme_file.get('patch', '')
-                if not patch:
+                default_branch = repo_data_gql.get('defaultBranchRef')
+                if not default_branch:
+                    logger.debug(f"  No default branch for {readme_path}")
                     continue
                 
-                # Extract additions
-                additions = extract_additions_from_diff(patch)
+                target = default_branch.get('target')
+                if not target:
+                    logger.debug(f"  No target for {readme_path}")
+                    continue
                 
-                # Detect emojis in additions
-                emojis = detect_emojis_in_text(additions)
+                history = target.get('history')
+                if not history:
+                    logger.debug(f"  No history for {readme_path}")
+                    continue
                 
-                if emojis:
-                    # Get author info
-                    author = node.get('author', {})
-                    author_name = author.get('name', 'Unknown')
-                    author_email = author.get('email', 'Unknown')
+                edges = history.get('edges', [])
+                if not edges:
+                    logger.debug(f"  No commits for {readme_path}")
+                    continue
+                
+                readme_found = True
+                logger.info(f"  ✓ Found {len(edges)} commits for {readme_path}")
+                
+                # Process each commit
+                for edge in edges:
+                    try:
+                        node = edge['node']
+                        commit_sha = node['oid']
+                        
+                        # Get detailed commit info with diff
+                        commit_details = github_client.get_commit_details(owner, name, commit_sha)
+                        
+                        if not commit_details:
+                            logger.debug(f"  Skipping commit {commit_sha[:8]} (no details)")
+                            continue
+                        
+                        # Find README file in commit
+                        readme_file = None
+                        for file in commit_details.get('files', []):
+                            if file['filename'].upper() == readme_path.upper():
+                                readme_file = file
+                                break
+                        
+                        if not readme_file:
+                            continue
+                        
+                        # Get the patch (diff)
+                        patch = readme_file.get('patch', '')
+                        if not patch:
+                            continue
+                        
+                        # Extract additions
+                        additions = extract_additions_from_diff(patch)
+                        
+                        # Detect emojis in additions
+                        emojis = detect_emojis_in_text(additions)
+                        
+                        if emojis:
+                            # Get author info
+                            author = node.get('author', {})
+                            author_name = author.get('name', 'Unknown')
+                            author_email = author.get('email', 'Unknown')
+                            
+                            # Check if it's from a PR
+                            pr_nodes = node.get('associatedPullRequests', {}).get('nodes', [])
+                            is_pr = len(pr_nodes) > 0
+                            pr_number = pr_nodes[0]['number'] if is_pr else None
+                            
+                            # Create result
+                            result = CommitResult(
+                                repo_owner=owner,
+                                repo_name=name,
+                                repo_url=url,
+                                commit_sha=commit_sha,
+                                commit_datetime=node['committedDate'],
+                                author_name=author_name,
+                                author_email=author_email,
+                                commit_message=node['message'].split('\n')[0][:200],  # First line, max 200 chars
+                                emojis_detected='|'.join(sorted(emojis)),
+                                readme_additions_snippet=additions[:500],  # First 500 chars
+                                deepseek_affiliation=deepseek_aff,
+                                chatgpt_affiliation=chatgpt_aff,
+                                is_pull_request=is_pr,
+                                pr_number=pr_number,
+                                readme_file_path=readme_path
+                            )
+                            
+                            results.append(result)
+                            logger.info(f"  🎯 Found emoji commit: {commit_sha[:8]} - {', '.join(emojis)}")
                     
-                    # Check if it's from a PR
-                    pr_nodes = node.get('associatedPullRequests', {}).get('nodes', [])
-                    is_pr = len(pr_nodes) > 0
-                    pr_number = pr_nodes[0]['number'] if is_pr else None
-                    
-                    # Create result
-                    result = CommitResult(
-                        repo_owner=owner,
-                        repo_name=name,
-                        repo_url=url,
-                        commit_sha=commit_sha,
-                        commit_datetime=node['committedDate'],
-                        author_name=author_name,
-                        author_email=author_email,
-                        commit_message=node['message'].split('\n')[0][:200],  # First line, max 200 chars
-                        emojis_detected='|'.join(sorted(emojis)),
-                        readme_additions_snippet=additions[:500],  # First 500 chars
-                        deepseek_affiliation=deepseek_aff,
-                        chatgpt_affiliation=chatgpt_aff,
-                        is_pull_request=is_pr,
-                        pr_number=pr_number,
-                        readme_file_path=readme_path
-                    )
-                    
-                    results.append(result)
-                    logger.info(f"  🎯 Found emoji commit: {commit_sha[:8]} - {', '.join(emojis)}")
+                    except Exception as commit_error:
+                        logger.warning(f"  ⚠️ Error processing commit in {owner}/{name}: {str(commit_error)[:100]}")
+                        continue
+                
+                # If we found commits for this README, don't check other variations
+                if results:
+                    break
             
-            # If we found commits for this README, don't check other variations
-            if results:
-                break
-        
-        if not readme_found:
-            logger.debug(f"  ⚠ No README file found in {owner}/{name}")
-        elif not results:
-            logger.debug(f"  ℹ No emoji commits found in {owner}/{name}")
-        
-        return results
-        
-    except Exception as e:
-        logger.error(f"❌ Error processing {owner}/{name}: {e}")
-        logger.debug(traceback.format_exc())
-        return []
+            if not readme_found:
+                logger.debug(f"  ⚠ No README file found in {owner}/{name}")
+            elif not results:
+                logger.debug(f"  ℹ No emoji commits found in {owner}/{name}")
+            
+            # Success - return results
+            return results
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing {owner}/{name} (attempt {repo_attempt + 1}/{max_retries}): {str(e)[:150]}")
+            logger.debug(traceback.format_exc())
+            
+            if repo_attempt < max_retries - 1:
+                logger.info(f"  🔄 Retrying {owner}/{name} in 3 seconds...")
+                time.sleep(3)
+            else:
+                logger.error(f"❌ Failed to process {owner}/{name} after {max_retries} attempts")
+                return []
+    
+    return []
 
 # ============================================================================
 # MAIN PROCESSING
@@ -792,6 +870,8 @@ def main():
     all_results = []
     processed_count = 0
     error_count = 0
+    last_error_notification = datetime.now()
+    consecutive_errors = 0
     
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(token_manager.tokens))) as executor:
         # Submit all tasks
@@ -809,6 +889,10 @@ def main():
                 results = future.result()
                 all_results.extend(results)
                 
+                # Reset consecutive errors on success
+                if results or consecutive_errors > 0:
+                    consecutive_errors = 0
+                
                 # Log progress every 10 repositories
                 if processed_count % 10 == 0:
                     progress = (processed_count / len(repositories)) * 100
@@ -816,6 +900,7 @@ def main():
                     
                     logger.info(f"📊 Progress: {processed_count}/{len(repositories)} ({progress:.1f}%) - "
                               f"Found: {len(all_results)} commits - "
+                              f"Errors: {error_count} - "
                               f"Tokens: {stats['available_tokens']} available, {stats['exhausted_tokens']} exhausted")
                     
                     # Send progress update to Discord
@@ -824,6 +909,7 @@ def main():
                             f"📊 Progress Update\n"
                             f"Processed: {processed_count}/{len(repositories)} ({progress:.1f}%)\n"
                             f"Emoji commits found: {len(all_results)}\n"
+                            f"Errors: {error_count}\n"
                             f"Tokens: {stats['available_tokens']} available, {stats['exhausted_tokens']} exhausted\n"
                             f"Total API requests: {stats['total_requests']}",
                             "Progress Update"
@@ -832,12 +918,31 @@ def main():
                 # Check if all tokens are exhausted
                 if token_manager.all_tokens_exhausted() and token_manager.global_sleep_mode:
                     # Only one thread should handle the sleep
-                    stats = token_manager.get_stats()
+                    logger.warning("🛑 All tokens exhausted, initiating sleep period...")
                     token_manager.sleep_and_reset(notifier, processed_count, len(repositories))
                 
             except Exception as e:
                 error_count += 1
-                logger.error(f"❌ Error processing {repo['repo_owner']}/{repo['repo_name']}: {e}")
+                consecutive_errors += 1
+                error_msg = str(e)[:150]
+                logger.error(f"❌ Error processing {repo['repo_owner']}/{repo['repo_name']}: {error_msg}")
+                logger.debug(traceback.format_exc())
+                
+                # Send notification if too many consecutive errors
+                if consecutive_errors >= 10:
+                    current_time = datetime.now()
+                    # Only send error notification every 5 minutes
+                    if (current_time - last_error_notification).total_seconds() >= 300:
+                        notifier.send(
+                            f"⚠️ High Error Rate Detected\n"
+                            f"Consecutive errors: {consecutive_errors}\n"
+                            f"Total errors: {error_count}\n"
+                            f"Progress: {processed_count}/{len(repositories)}\n"
+                            f"Last error: {error_msg}",
+                            "Error Alert"
+                        )
+                        last_error_notification = current_time
+                        consecutive_errors = 0  # Reset after notification
     
     # Save results
     save_results(all_results)
