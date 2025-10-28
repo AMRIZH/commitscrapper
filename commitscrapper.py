@@ -12,6 +12,7 @@ import time
 import re
 import logging
 from datetime import datetime, timedelta
+import threading
 
 # Increase CSV field size limit for large README content
 csv.field_size_limit(1000000)
@@ -280,23 +281,31 @@ class TokenManager:
     
     def sleep_and_reset(self, notifier, processed_count: int, total_repos: int):
         """Sleep for rate limit period and reset global sleep mode"""
+        # First check: is sleep mode even active? (quick check without lock)
+        if not self.global_sleep_mode:
+            return  # Another thread already handled it
+        
         with self.lock:
+            # Second check: recheck after acquiring lock
             if not self.global_sleep_mode:
-                return  # Already handled by another thread
+                return  # Another thread handled it while we were waiting for lock
             
-            stats = self.get_stats()
+            # We're the chosen thread to handle the sleep
             logger.warning(f"⚠️ All {len(self.tokens)} tokens exhausted! Sleeping for {RATE_LIMIT_SLEEP}s (1 hour)...")
-            
+            stats = self.get_stats()
+        
         # Send notification (outside lock to avoid blocking)
         notifier.send(
             f"⏸️ Rate limit reached\n"
             f"All {len(self.tokens)} tokens exhausted\n"
             f"Sleeping for 1 hour...\n"
-            f"Progress: {processed_count}/{total_repos}",
+            f"Progress: {processed_count}/{total_repos}\n"
+            f"Available tokens: {stats['available_tokens']}/{stats['total_tokens']}",
             "Rate Limit Hit"
         )
         
-        # Sleep (outside lock so other threads can finish)
+        # Sleep (outside lock so other threads can finish their current tasks)
+        logger.info(f"😴 Sleeping for {RATE_LIMIT_SLEEP} seconds...")
         time.sleep(RATE_LIMIT_SLEEP)
         
         # Reset global sleep mode and token reset times
@@ -308,6 +317,14 @@ class TokenManager:
                 self.token_stats[token]["reset_time"] = None
             self.global_sleep_mode = False
             logger.info("✓ All tokens reset, resuming scraping...")
+        
+        # Send resume notification
+        notifier.send(
+            f"▶️ Resuming scraping\n"
+            f"All tokens reset\n"
+            f"Progress: {processed_count}/{total_repos}",
+            "Scraping Resumed"
+        )
 
 # ============================================================================
 # DISCORD NOTIFICATIONS
@@ -392,7 +409,9 @@ class GitHubClient:
             try:
                 time.sleep(REQUEST_DELAY)  # Rate limiting delay
                 
+                logger.debug(f"🌐 Making {method} request to {url[:80]}... (attempt {attempt + 1}/{max_retries})")
                 response = self.session.request(method, url, timeout=30, **kwargs)
+                logger.debug(f"✓ Response received: {response.status_code}")
                 
                 # Update rate limit info
                 if 'X-RateLimit-Remaining' in response.headers:
@@ -832,6 +851,41 @@ def save_results(results: List[CommitResult]):
         logger.error(f"❌ Failed to save results: {e}")
         raise
 
+def watchdog_thread(processed_count_ref: Dict, total_repos: int, notifier: DiscordNotifier, stop_event: threading.Event):
+    """Watchdog thread to detect if scraping has hung"""
+    last_count = 0
+    hang_checks = 0
+    
+    while not stop_event.is_set():
+        time.sleep(120)  # Check every 2 minutes
+        
+        if stop_event.is_set():
+            break
+        
+        current_count = processed_count_ref.get('count', 0)
+        
+        # Check if progress was made
+        if current_count > last_count:
+            # Progress detected, reset hang counter
+            hang_checks = 0
+            last_count = current_count
+            logger.debug(f"🔍 Watchdog: Progress detected ({current_count}/{total_repos})")
+        else:
+            # No progress detected
+            hang_checks += 1
+            logger.warning(f"⚠️ Watchdog: No progress for {hang_checks * 2} minutes ({current_count}/{total_repos})")
+            
+            # If no progress for 10 minutes (5 checks), send alert
+            if hang_checks >= 5:
+                notifier.send(
+                    f"🚨 Possible Hang Detected!\n"
+                    f"No progress for {hang_checks * 2} minutes\n"
+                    f"Stuck at: {current_count}/{total_repos}\n"
+                    f"Check logs for details",
+                    "Hang Alert"
+                )
+                hang_checks = 0  # Reset to avoid spam
+
 def main():
     """Main execution function"""
     start_time = datetime.now()
@@ -866,24 +920,42 @@ def main():
     filter_status = "with affiliation only" if FILTER_BY_AFFILIATION else "all repos (no filter)"
     logger.info(f"🎯 Processing {len(repositories)} repositories ({filter_status}) with {MAX_WORKERS} workers")
     
+    # Start watchdog thread to detect hangs
+    processed_count_ref = {'count': 0}
+    stop_watchdog = threading.Event()
+    watchdog = threading.Thread(
+        target=watchdog_thread,
+        args=(processed_count_ref, len(repositories), notifier, stop_watchdog),
+        daemon=True,
+        name="WatchdogThread"
+    )
+    watchdog.start()
+    logger.info("🔍 Watchdog thread started to monitor for hangs")
+    
     # Process repositories with threading
     all_results = []
     processed_count = 0
     error_count = 0
     last_error_notification = datetime.now()
     consecutive_errors = 0
+    last_progress_log = datetime.now()
+    
+    logger.info(f"⚡ Starting ThreadPoolExecutor with {min(MAX_WORKERS, len(token_manager.tokens))} workers...")
     
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(token_manager.tokens))) as executor:
         # Submit all tasks
+        logger.info(f"📤 Submitting {len(repositories)} repository tasks to executor...")
         future_to_repo = {
             executor.submit(process_repository, repo, github_client, notifier): repo
             for repo in repositories
         }
+        logger.info(f"✓ All {len(repositories)} tasks submitted, waiting for completion...")
         
         # Process completed tasks
         for future in as_completed(future_to_repo):
             repo = future_to_repo[future]
             processed_count += 1
+            processed_count_ref['count'] = processed_count  # Update watchdog reference
             
             try:
                 results = future.result()
@@ -893,8 +965,11 @@ def main():
                 if results or consecutive_errors > 0:
                     consecutive_errors = 0
                 
-                # Log progress every 10 repositories
-                if processed_count % 10 == 0:
+                # Log progress every 10 repositories OR every 30 seconds
+                current_time = datetime.now()
+                time_since_last_log = (current_time - last_progress_log).total_seconds()
+                
+                if processed_count % 10 == 0 or time_since_last_log >= 30:
                     progress = (processed_count / len(repositories)) * 100
                     stats = token_manager.get_stats()
                     
@@ -902,6 +977,8 @@ def main():
                               f"Found: {len(all_results)} commits - "
                               f"Errors: {error_count} - "
                               f"Tokens: {stats['available_tokens']} available, {stats['exhausted_tokens']} exhausted")
+                    
+                    last_progress_log = current_time
                     
                     # Send progress update to Discord
                     if processed_count % 50 == 0:
@@ -915,10 +992,9 @@ def main():
                             "Progress Update"
                         )
                 
-                # Check if all tokens are exhausted
-                if token_manager.all_tokens_exhausted() and token_manager.global_sleep_mode:
-                    # Only one thread should handle the sleep
-                    logger.warning("🛑 All tokens exhausted, initiating sleep period...")
+                # Check if global sleep mode is active (one thread will handle the sleep)
+                if token_manager.global_sleep_mode:
+                    logger.warning("🛑 Global sleep mode detected, initiating sleep period...")
                     token_manager.sleep_and_reset(notifier, processed_count, len(repositories))
                 
             except Exception as e:
@@ -943,6 +1019,13 @@ def main():
                         )
                         last_error_notification = current_time
                         consecutive_errors = 0  # Reset after notification
+    
+    logger.info(f"✓ ThreadPoolExecutor completed all tasks")
+    
+    # Stop watchdog thread
+    stop_watchdog.set()
+    watchdog.join(timeout=5)
+    logger.info("✓ Watchdog thread stopped")
     
     # Save results
     save_results(all_results)
