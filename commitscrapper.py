@@ -168,6 +168,8 @@ class TokenManager:
                            for token in self.tokens}
         self.lock = Lock()
         self.current_index = 0
+        self.global_sleep_mode = False  # Flag to stop all workers when exhausted
+        self.last_exhaustion_check = datetime.now()
         
         logger.info(f"✓ Loaded {len(self.tokens)} GitHub tokens")
     
@@ -198,6 +200,11 @@ class TokenManager:
     def get_token(self) -> str:
         """Get next available token with rate limit check and dynamic borrowing"""
         with self.lock:
+            # Check if we're in global sleep mode
+            if self.global_sleep_mode:
+                logger.debug("In global sleep mode, waiting...")
+                return self.tokens[0]  # Return any token, request will be blocked
+            
             # First pass: Try tokens starting from current index (normal rotation)
             for _ in range(len(self.tokens)):
                 token = self.tokens[self.current_index]
@@ -220,8 +227,9 @@ class TokenManager:
                     logger.info(f"✓ Borrowed token #{idx + 1} (remaining: {self.token_stats[token]['remaining']})")
                     return token
             
-            # All tokens exhausted - return first one anyway (will trigger rate limit handling)
-            logger.warning("⚠️ All tokens exhausted, returning token #1 (may trigger rate limit)")
+            # All tokens exhausted - enable global sleep mode
+            logger.warning("⚠️ All tokens exhausted, enabling global sleep mode")
+            self.global_sleep_mode = True
             token = self.tokens[0]
             self.token_stats[token]["requests"] += 1
             return token
@@ -269,6 +277,37 @@ class TokenManager:
                 if self._is_token_available(token):
                     return False  # At least one token is available
             return True  # All tokens are exhausted
+    
+    def sleep_and_reset(self, notifier, processed_count: int, total_repos: int):
+        """Sleep for rate limit period and reset global sleep mode"""
+        with self.lock:
+            if not self.global_sleep_mode:
+                return  # Already handled by another thread
+            
+            stats = self.get_stats()
+            logger.warning(f"⚠️ All {len(self.tokens)} tokens exhausted! Sleeping for {RATE_LIMIT_SLEEP}s (1 hour)...")
+            
+        # Send notification (outside lock to avoid blocking)
+        notifier.send(
+            f"⏸️ Rate limit reached\n"
+            f"All {len(self.tokens)} tokens exhausted\n"
+            f"Sleeping for 1 hour...\n"
+            f"Progress: {processed_count}/{total_repos}",
+            "Rate Limit Hit"
+        )
+        
+        # Sleep (outside lock so other threads can finish)
+        time.sleep(RATE_LIMIT_SLEEP)
+        
+        # Reset global sleep mode and token reset times
+        with self.lock:
+            logger.info("✓ Sleep period ended, resetting tokens...")
+            # Reset all tokens as they should have recovered
+            for token in self.tokens:
+                self.token_stats[token]["remaining"] = 5000
+                self.token_stats[token]["reset_time"] = None
+            self.global_sleep_mode = False
+            logger.info("✓ All tokens reset, resuming scraping...")
 
 # ============================================================================
 # DISCORD NOTIFICATIONS
@@ -327,6 +366,11 @@ class GitHubClient:
         max_retries = 3
         
         for attempt in range(max_retries):
+            # Check if we're in global sleep mode
+            if self.token_manager.global_sleep_mode:
+                logger.debug("Global sleep mode active, skipping request")
+                return None
+            
             token = self.token_manager.get_token()
             headers = kwargs.get('headers', {})
             headers.update({
@@ -349,7 +393,15 @@ class GitHubClient:
                 
                 # Handle rate limiting
                 if response.status_code == 403 and 'rate limit' in response.text.lower():
-                    logger.warning(f"Rate limit hit for token, retrying with next token...")
+                    logger.warning(f"Rate limit hit for current token (remaining: {remaining if 'remaining' in locals() else 'unknown'})")
+                    
+                    # Check if all tokens are exhausted (avoid retry spam)
+                    if self.token_manager.all_tokens_exhausted():
+                        logger.warning("All tokens exhausted, stopping retries")
+                        return None
+                    
+                    # Try next token
+                    logger.debug(f"Retrying with next token (attempt {attempt + 1}/{max_retries})...")
                     continue
                 
                 # Handle other errors
@@ -778,16 +830,10 @@ def main():
                         )
                 
                 # Check if all tokens are exhausted
-                if token_manager.all_tokens_exhausted():
-                    logger.warning("⚠️ All tokens exhausted! Waiting 1 hour...")
-                    notifier.send(
-                        f"⏸️ Rate limit reached\n"
-                        f"All {stats['total_tokens']} tokens exhausted\n"
-                        f"Sleeping for 1 hour...\n"
-                        f"Progress: {processed_count}/{len(repositories)}",
-                        "Rate Limit Hit"
-                    )
-                    time.sleep(RATE_LIMIT_SLEEP)
+                if token_manager.all_tokens_exhausted() and token_manager.global_sleep_mode:
+                    # Only one thread should handle the sleep
+                    stats = token_manager.get_stats()
+                    token_manager.sleep_and_reset(notifier, processed_count, len(repositories))
                 
             except Exception as e:
                 error_count += 1
