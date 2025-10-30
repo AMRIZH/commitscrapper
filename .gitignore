@@ -6,3 +6,4 @@ github_affiliation_combined.csv
 github_affiliation_combined_cleaned.csv
 __pycache__
 filepath.txt
+datasets/

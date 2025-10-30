@@ -32,6 +32,30 @@ load_dotenv()
 # CONFIGURATION
 # ============================================================================
 
+# API Configuration
+REQUEST_DELAY = 0.05  # 50ms delay between requests
+RATE_LIMIT_SLEEP = 3600  # 1 hour sleep when all tokens exhausted
+MAX_WORKERS = 12  # Maximum concurrent workers (match CPU threads: 2core/4thread)
+
+# Filter Configuration
+# Set to True to check only repos with affiliation (deepseek or chatgpt)
+# Set to False to check ALL repos regardless of affiliation
+FILTER_BY_AFFILIATION = True  # Default: check all repos (False)
+
+# File paths
+INPUT_CSV = r"datasets/affiliated_deepseek_1000_200000.csv"
+OUTPUT_CSV = "results/political_emoji_commits.csv"
+LOG_DIR = "logs"
+LOG_FILE = f"{LOG_DIR}/scraper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+# README file patterns to check
+README_PATTERNS = [
+    "README.md", "readme.md", "README.MD", 
+    "README.rst", "README.txt", "README",
+    "Readme.md", "ReadMe.md"
+]
+
+# Political emojis to track
 POLITICAL_EMOJIS = [
     "🇮🇱","💙","🤍","✡️","🇵🇸","❤️","💚","🖤","🍉",
     "🇺🇦","💙","💛","🌻","🇷🇺",
@@ -75,29 +99,6 @@ EMOJI_SHORTCODES = {
     "🏳️‍🌈": [":rainbow_flag:", ":pride_flag:"],
     "🏳️‍⚧️": [":transgender_flag:"],
 }
-
-# File paths
-INPUT_CSV = "github_affiliation_combined_cleaned.csv"
-OUTPUT_CSV = "results/political_emoji_commits.csv"
-LOG_DIR = "logs"
-LOG_FILE = f"{LOG_DIR}/scraper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-
-# API Configuration
-REQUEST_DELAY = 0.05  # 50ms delay between requests
-RATE_LIMIT_SLEEP = 3600  # 1 hour sleep when all tokens exhausted
-MAX_WORKERS = 20  # Maximum concurrent workers
-
-# Filter Configuration
-# Set to True to check only repos with affiliation (deepseek or chatgpt)
-# Set to False to check ALL repos regardless of affiliation
-FILTER_BY_AFFILIATION = False  # Default: only check repos with affiliation
-
-# README file patterns to check
-README_PATTERNS = [
-    "README.md", "readme.md", "README.MD", 
-    "README.rst", "README.txt", "README",
-    "Readme.md", "ReadMe.md"
-]
 
 # ============================================================================
 # DATA CLASSES
@@ -170,6 +171,7 @@ class TokenManager:
         self.lock = Lock()
         self.current_index = 0
         self.global_sleep_mode = False  # Flag to stop all workers when exhausted
+        self.sleep_in_progress = False  # Flag to ensure only one thread handles sleep
         self.last_exhaustion_check = datetime.now()
         
         logger.info(f"✓ Loaded {len(self.tokens)} GitHub tokens")
@@ -287,22 +289,26 @@ class TokenManager:
         
         with self.lock:
             # Second check: recheck after acquiring lock
-            if not self.global_sleep_mode:
+            if not self.global_sleep_mode or self.sleep_in_progress:
                 return  # Another thread handled it while we were waiting for lock
             
             # We're the chosen thread to handle the sleep
+            self.sleep_in_progress = True
             logger.warning(f"⚠️ All {len(self.tokens)} tokens exhausted! Sleeping for {RATE_LIMIT_SLEEP}s (1 hour)...")
             stats = self.get_stats()
         
         # Send notification (outside lock to avoid blocking)
-        notifier.send(
-            f"⏸️ Rate limit reached\n"
-            f"All {len(self.tokens)} tokens exhausted\n"
-            f"Sleeping for 1 hour...\n"
-            f"Progress: {processed_count}/{total_repos}\n"
-            f"Available tokens: {stats['available_tokens']}/{stats['total_tokens']}",
-            "Rate Limit Hit"
-        )
+        try:
+            notifier.send(
+                f"⏸️ Rate limit reached\n"
+                f"All {len(self.tokens)} tokens exhausted\n"
+                f"Sleeping for 1 hour...\n"
+                f"Progress: {processed_count}/{total_repos}\n"
+                f"Available tokens: {stats['available_tokens']}/{stats['total_tokens']}",
+                "Rate Limit Hit"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send sleep notification: {e}")
         
         # Sleep (outside lock so other threads can finish their current tasks)
         logger.info(f"😴 Sleeping for {RATE_LIMIT_SLEEP} seconds...")
@@ -316,15 +322,19 @@ class TokenManager:
                 self.token_stats[token]["remaining"] = 5000
                 self.token_stats[token]["reset_time"] = None
             self.global_sleep_mode = False
+            self.sleep_in_progress = False
             logger.info("✓ All tokens reset, resuming scraping...")
         
         # Send resume notification
-        notifier.send(
-            f"▶️ Resuming scraping\n"
-            f"All tokens reset\n"
-            f"Progress: {processed_count}/{total_repos}",
-            "Scraping Resumed"
-        )
+        try:
+            notifier.send(
+                f"▶️ Resuming scraping\n"
+                f"All tokens reset\n"
+                f"Progress: {processed_count}/{total_repos}",
+                "Scraping Resumed"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send resume notification: {e}")
 
 # ============================================================================
 # DISCORD NOTIFICATIONS
@@ -358,10 +368,13 @@ class DiscordNotifier:
                 }]
             }
             
-            response = requests.post(self.webhook_url, json=payload, timeout=10)
+            # Use shorter timeout to prevent blocking threads
+            response = requests.post(self.webhook_url, json=payload, timeout=5)
             response.raise_for_status()
             logger.debug("Discord notification sent successfully")
             
+        except requests.exceptions.Timeout:
+            logger.warning("Discord notification timed out (5s)")
         except Exception as e:
             logger.error(f"Failed to send Discord notification: {e}")
 
@@ -942,6 +955,24 @@ Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     
     return report
 
+def rate_limit_monitor_thread(token_manager: 'TokenManager', notifier: DiscordNotifier, processed_count_ref: Dict, total_repos: int, stop_event: threading.Event):
+    """Monitor thread to handle global sleep mode when all tokens are exhausted"""
+    logger.info("🔍 Rate limit monitor thread started")
+    
+    while not stop_event.is_set():
+        time.sleep(5)  # Check every 5 seconds for rate limit exhaustion
+        
+        if stop_event.is_set():
+            break
+        
+        # Check if global sleep mode is active
+        if token_manager.global_sleep_mode and not token_manager.sleep_in_progress:
+            logger.warning("🛑 Rate limit monitor detected global sleep mode, initiating sleep...")
+            processed_count = processed_count_ref.get('count', 0)
+            token_manager.sleep_and_reset(notifier, processed_count, total_repos)
+    
+    logger.info("✓ Rate limit monitor thread stopped")
+
 def watchdog_thread(processed_count_ref: Dict, total_repos: int, notifier: DiscordNotifier, stop_event: threading.Event):
     """Watchdog thread to detect if scraping has hung"""
     last_count = 0
@@ -1013,12 +1044,23 @@ def main():
     filter_status = "with affiliation only" if FILTER_BY_AFFILIATION else "all repos (no filter)"
     logger.info(f"🎯 Processing {len(repositories)} repositories ({filter_status}) with {MAX_WORKERS} workers")
     
-    # Start watchdog thread to detect hangs
+    # Start rate limit monitor thread to handle global sleep mode
     processed_count_ref = {'count': 0}
-    stop_watchdog = threading.Event()
+    stop_threads = threading.Event()
+    
+    rate_monitor = threading.Thread(
+        target=rate_limit_monitor_thread,
+        args=(token_manager, notifier, processed_count_ref, len(repositories), stop_threads),
+        daemon=True,
+        name="RateLimitMonitor"
+    )
+    rate_monitor.start()
+    logger.info("🔍 Rate limit monitor thread started")
+    
+    # Start watchdog thread to detect hangs
     watchdog = threading.Thread(
         target=watchdog_thread,
-        args=(processed_count_ref, len(repositories), notifier, stop_watchdog),
+        args=(processed_count_ref, len(repositories), notifier, stop_threads),
         daemon=True,
         name="WatchdogThread"
     )
@@ -1091,10 +1133,7 @@ def main():
                             f"Milestone: {progress:.0f}% Complete"
                         )
                 
-                # Check if global sleep mode is active (one thread will handle the sleep)
-                if token_manager.global_sleep_mode:
-                    logger.warning("🛑 Global sleep mode detected, initiating sleep period...")
-                    token_manager.sleep_and_reset(notifier, processed_count, len(repositories))
+                # Note: Global sleep mode is now handled by rate_limit_monitor_thread
                 
             except Exception as e:
                 error_count += 1
@@ -1120,10 +1159,11 @@ def main():
     
     logger.info(f"✓ ThreadPoolExecutor completed all tasks")
     
-    # Stop watchdog thread
-    stop_watchdog.set()
+    # Stop monitor threads
+    stop_threads.set()
+    rate_monitor.join(timeout=5)
     watchdog.join(timeout=5)
-    logger.info("✓ Watchdog thread stopped")
+    logger.info("✓ Monitor threads stopped")
     
     # Save results
     save_results(all_results)
